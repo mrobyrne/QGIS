@@ -1,0 +1,675 @@
+# -*- coding: utf-8 -*-
+"""
+Layer Theme Creator
+-------------------
+QGIS Processing Script
+
+Workflow:
+  1. Select a folder of layers (.shp / rasters).
+  2. Edit Display Names; optionally assign a per-layer Alt Theme and/or
+     restrict which QML style is applied to that layer.
+  3. Select a Default Theme (base visibility for all themes).
+  4. Add QML files — each gets a Style Name and optional Suffix.
+  5. Click Apply — layers load, named styles are saved, themes are created:
+       DisplayName - StyleName - Suffix
+  6. Use Save / Load Settings to persist the configuration between sessions.
+"""
+
+import json
+import os
+import re
+
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtWidgets import (
+    QAbstractItemView, QComboBox, QDialog, QFileDialog,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QSizePolicy, QTableWidget,
+    QTableWidgetItem, QVBoxLayout,
+)
+from qgis.core import (
+    QgsMapLayerStyle, QgsMapThemeCollection,
+    QgsProcessingAlgorithm, QgsProject,
+    QgsRasterLayer, QgsVectorLayer,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+RASTER_EXTS = frozenset([
+    '.tif', '.tiff', '.asc', '.img', '.vrt',
+    '.bil', '.nc', '.flt', '.grd', '.dem',
+])
+VECTOR_EXTS = frozenset(['.shp'])
+ALL_EXTS = RASTER_EXTS | VECTOR_EXTS
+
+# Layer table column indices
+COL_SRC   = 0
+COL_NAME  = 1
+COL_THEME = 2
+COL_QML   = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def auto_clean(stem):
+    """Convert a filename stem to a readable title-cased display name."""
+    name = re.sub(r'[_\-]+', ' ', stem)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name.title()
+
+
+def _make_combo(options, fixed_width=None):
+    """Return a QComboBox pre-populated with *options*."""
+    cb = QComboBox()
+    cb.addItems(options)
+    if fixed_width:
+        cb.setFixedWidth(fixed_width)
+    cb.setMaximumHeight(24)
+    return cb
+
+
+# ---------------------------------------------------------------------------
+# Dialog
+# ---------------------------------------------------------------------------
+
+class LayerThemeDialog(QDialog):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Layer Theme Creator')
+        self.setMinimumSize(960, 680)
+        self._folder = ''
+        self._build_ui()
+        self._refresh_themes()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        # --- Source folder ---
+        folder_group = QGroupBox('Source Folder')
+        fg = QHBoxLayout(folder_group)
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText('Select folder containing layers…')
+        self.folder_edit.textChanged.connect(self._on_folder_changed)
+        browse_btn = QPushButton('Browse…')
+        browse_btn.setFixedWidth(90)
+        browse_btn.clicked.connect(self._browse_folder)
+        fg.addWidget(self.folder_edit)
+        fg.addWidget(browse_btn)
+        root.addWidget(folder_group)
+
+        # --- Default theme ---
+        theme_group = QGroupBox(
+            'Default Theme  '
+            '(base visibility applied to every generated theme)'
+        )
+        tg = QHBoxLayout(theme_group)
+        self.default_theme_combo = QComboBox()
+        self.default_theme_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        refresh_btn = QPushButton('Refresh')
+        refresh_btn.setFixedWidth(70)
+        refresh_btn.clicked.connect(self._refresh_themes)
+        tg.addWidget(self.default_theme_combo)
+        tg.addWidget(refresh_btn)
+        root.addWidget(theme_group)
+
+        # --- Detected layers ---
+        layers_group = QGroupBox(
+            'Detected Layers  '
+            '(Display Name drives legend & theme label  |  '
+            'Alt Theme overrides Default Theme for that layer  |  '
+            'QML restricts which style is applied)'
+        )
+        lg = QVBoxLayout(layers_group)
+        self.layer_table = QTableWidget(0, 4)
+        self.layer_table.setHorizontalHeaderLabels(
+            ['Source File', 'Display Name', 'Alt Theme', 'QML']
+        )
+        hh = self.layer_table.horizontalHeader()
+        hh.setSectionResizeMode(COL_SRC,   QHeaderView.Stretch)
+        hh.setSectionResizeMode(COL_NAME,  QHeaderView.Stretch)
+        hh.setSectionResizeMode(COL_THEME, QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_QML,   QHeaderView.Fixed)
+        self.layer_table.setColumnWidth(COL_THEME, 180)
+        self.layer_table.setColumnWidth(COL_QML,   160)
+        self.layer_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.layer_table.setAlternatingRowColors(True)
+        self.layer_table.verticalHeader().setDefaultSectionSize(26)
+        self.layer_table.setMinimumHeight(160)
+        lg.addWidget(self.layer_table)
+        root.addWidget(layers_group)
+
+        # --- QML styles ---
+        qml_group = QGroupBox('QML Styles')
+        ql = QVBoxLayout(qml_group)
+
+        qml_btns = QHBoxLayout()
+        add_btn = QPushButton('Add QML…')
+        add_btn.clicked.connect(self._add_qml_rows)
+        self.remove_btn = QPushButton('Remove Selected')
+        self.remove_btn.clicked.connect(self._remove_qml_rows)
+        qml_btns.addWidget(add_btn)
+        qml_btns.addWidget(self.remove_btn)
+        qml_btns.addStretch()
+        ql.addLayout(qml_btns)
+
+        self.qml_table = QTableWidget(0, 3)
+        self.qml_table.setHorizontalHeaderLabels(
+            ['QML File', 'Style Name', 'Suffix (optional)']
+        )
+        qh = self.qml_table.horizontalHeader()
+        qh.setSectionResizeMode(0, QHeaderView.Stretch)
+        qh.setSectionResizeMode(1, QHeaderView.Fixed)
+        qh.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.qml_table.setColumnWidth(1, 170)
+        self.qml_table.setColumnWidth(2, 110)
+        self.qml_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.qml_table.setAlternatingRowColors(True)
+        self.qml_table.verticalHeader().setDefaultSectionSize(22)
+        self.qml_table.setMinimumHeight(120)
+        # Refresh layer QML dropdowns when a style name is edited
+        self.qml_table.itemChanged.connect(self._on_qml_item_changed)
+        ql.addWidget(self.qml_table)
+
+        hint = QLabel('Theme names:  <i>Display Name – Style Name – Suffix</i>')
+        hint.setAlignment(Qt.AlignRight)
+        ql.addWidget(hint)
+        root.addWidget(qml_group)
+
+        # --- Action buttons ---
+        btn_row = QHBoxLayout()
+        load_btn = QPushButton('Load Settings…')
+        load_btn.clicked.connect(self._load_settings)
+        save_btn = QPushButton('Save Settings…')
+        save_btn.clicked.connect(self._save_settings)
+        btn_row.addWidget(load_btn)
+        btn_row.addWidget(save_btn)
+        btn_row.addStretch()
+        self.apply_btn = QPushButton('Apply')
+        self.apply_btn.setFixedWidth(110)
+        self.apply_btn.setDefault(True)
+        self.apply_btn.clicked.connect(self._apply)
+        close_btn = QPushButton('Close')
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.apply_btn)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # Theme / QML dropdown helpers
+    # ------------------------------------------------------------------
+
+    def _theme_options(self):
+        themes = sorted(QgsProject.instance().mapThemeCollection().mapThemes())
+        return ['(use default)'] + themes
+
+    def _qml_options(self):
+        return ['All'] + self._get_qml_style_names()
+
+    def _get_qml_style_names(self):
+        names = []
+        for row in range(self.qml_table.rowCount()):
+            item = self.qml_table.item(row, 1)
+            if item and item.text().strip():
+                names.append(item.text().strip())
+        return names
+
+    def _refresh_themes(self):
+        """Repopulate the Default Theme combo and all Alt Theme combos."""
+        # Default theme combo
+        current = self.default_theme_combo.currentText()
+        themes = sorted(QgsProject.instance().mapThemeCollection().mapThemes())
+        self.default_theme_combo.clear()
+        self.default_theme_combo.addItem('(none — themes contain only the target layer)')
+        self.default_theme_combo.addItems(themes)
+        idx = self.default_theme_combo.findText(current)
+        if idx >= 0:
+            self.default_theme_combo.setCurrentIndex(idx)
+
+        self._refresh_alt_theme_dropdowns()
+
+    def _refresh_alt_theme_dropdowns(self):
+        """Update Alt Theme combo in every layer row."""
+        options = self._theme_options()
+        for row in range(self.layer_table.rowCount()):
+            cb = self.layer_table.cellWidget(row, COL_THEME)
+            if not isinstance(cb, QComboBox):
+                continue
+            self._update_combo(cb, options)
+
+    def _refresh_qml_dropdowns(self):
+        """Update QML selection combo in every layer row."""
+        options = self._qml_options()
+        for row in range(self.layer_table.rowCount()):
+            cb = self.layer_table.cellWidget(row, COL_QML)
+            if not isinstance(cb, QComboBox):
+                continue
+            self._update_combo(cb, options)
+
+    @staticmethod
+    def _update_combo(combo, options):
+        """Replace combo items while preserving the current selection."""
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(options)
+        idx = combo.findText(current)
+        combo.setCurrentIndex(max(0, idx))
+        combo.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+
+    def _on_qml_item_changed(self, item):
+        if item.column() == 1:   # Style Name column changed
+            self._refresh_qml_dropdowns()
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Select Source Folder', self._folder or ''
+        )
+        if folder:
+            self.folder_edit.setText(folder)
+
+    def _on_folder_changed(self, folder):
+        self._folder = folder
+        if os.path.isdir(folder):
+            self._scan_folder(folder)
+        else:
+            self.layer_table.setRowCount(0)
+
+    def _scan_folder(self, folder):
+        files = sorted(
+            f for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in ALL_EXTS
+        )
+        self.layer_table.setRowCount(len(files))
+        for i, fname in enumerate(files):
+            stem = os.path.splitext(fname)[0]
+
+            src = QTableWidgetItem(fname)
+            src.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.layer_table.setItem(i, COL_SRC, src)
+
+            self.layer_table.setItem(i, COL_NAME, QTableWidgetItem(auto_clean(stem)))
+
+            self.layer_table.setCellWidget(
+                i, COL_THEME, _make_combo(self._theme_options(), 178)
+            )
+            self.layer_table.setCellWidget(
+                i, COL_QML, _make_combo(self._qml_options(), 158)
+            )
+
+    def _add_qml_rows(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, 'Select QML Files', '', 'QGIS Style Files (*.qml)'
+        )
+        self.qml_table.blockSignals(True)
+        for path in paths:
+            row = self.qml_table.rowCount()
+            self.qml_table.insertRow(row)
+
+            path_item = QTableWidgetItem(path)
+            path_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.qml_table.setItem(row, 0, path_item)
+
+            stem = os.path.splitext(os.path.basename(path))[0]
+            self.qml_table.setItem(row, 1, QTableWidgetItem(auto_clean(stem)))
+            self.qml_table.setItem(row, 2, QTableWidgetItem(''))
+        self.qml_table.blockSignals(False)
+        self._refresh_qml_dropdowns()
+
+    def _remove_qml_rows(self):
+        rows = sorted(
+            {idx.row() for idx in self.qml_table.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self.qml_table.removeRow(row)
+        self._refresh_qml_dropdowns()
+
+    # ------------------------------------------------------------------
+    # Save / Load settings
+    # ------------------------------------------------------------------
+
+    def _save_settings(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Settings', self._folder or '',
+            'JSON Settings (*.json)'
+        )
+        if not path:
+            return
+
+        data = {
+            'folder': self.folder_edit.text(),
+            'default_theme': self.default_theme_combo.currentText(),
+            'layers': [],
+            'qml_pairs': [],
+        }
+
+        for row in range(self.layer_table.rowCount()):
+            fi = self.layer_table.item(row, COL_SRC)
+            di = self.layer_table.item(row, COL_NAME)
+            tc = self.layer_table.cellWidget(row, COL_THEME)
+            qc = self.layer_table.cellWidget(row, COL_QML)
+            data['layers'].append({
+                'filename':      fi.text() if fi else '',
+                'display_name':  di.text() if di else '',
+                'alt_theme':     tc.currentText() if isinstance(tc, QComboBox) else '(use default)',
+                'qml_selection': qc.currentText() if isinstance(qc, QComboBox) else 'All',
+            })
+
+        for row in range(self.qml_table.rowCount()):
+            pi = self.qml_table.item(row, 0)
+            ni = self.qml_table.item(row, 1)
+            si = self.qml_table.item(row, 2)
+            data['qml_pairs'].append({
+                'path':       pi.text() if pi else '',
+                'style_name': ni.text() if ni else '',
+                'suffix':     si.text() if si else '',
+            })
+
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+        QMessageBox.information(self, 'Saved', f'Settings saved to:\n{path}')
+
+    def _load_settings(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load Settings', self._folder or '',
+            'JSON Settings (*.json)'
+        )
+        if not path or not os.path.isfile(path):
+            return
+
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # 1. Populate QML table first (needed so combo options are correct
+        #    when the folder scan creates layer rows)
+        self.qml_table.blockSignals(True)
+        self.qml_table.setRowCount(0)
+        for pair in data.get('qml_pairs', []):
+            row = self.qml_table.rowCount()
+            self.qml_table.insertRow(row)
+            pi = QTableWidgetItem(pair.get('path', ''))
+            pi.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.qml_table.setItem(row, 0, pi)
+            self.qml_table.setItem(row, 1, QTableWidgetItem(pair.get('style_name', '')))
+            self.qml_table.setItem(row, 2, QTableWidgetItem(pair.get('suffix', '')))
+        self.qml_table.blockSignals(False)
+
+        # 2. Set folder — triggers scan which creates layer rows with
+        #    combos already populated from the QML table above
+        self.folder_edit.setText(data.get('folder', ''))
+
+        # 3. Restore default theme
+        dt = data.get('default_theme', '')
+        idx = self.default_theme_combo.findText(dt)
+        if idx >= 0:
+            self.default_theme_combo.setCurrentIndex(idx)
+
+        # 4. Restore per-layer overrides keyed by filename
+        saved = {l['filename']: l for l in data.get('layers', [])}
+        for row in range(self.layer_table.rowCount()):
+            fi = self.layer_table.item(row, COL_SRC)
+            if not fi:
+                continue
+            entry = saved.get(fi.text())
+            if not entry:
+                continue
+
+            di = self.layer_table.item(row, COL_NAME)
+            if di:
+                di.setText(entry.get('display_name', di.text()))
+
+            tc = self.layer_table.cellWidget(row, COL_THEME)
+            if isinstance(tc, QComboBox):
+                i = tc.findText(entry.get('alt_theme', '(use default)'))
+                if i >= 0:
+                    tc.setCurrentIndex(i)
+
+            qc = self.layer_table.cellWidget(row, COL_QML)
+            if isinstance(qc, QComboBox):
+                i = qc.findText(entry.get('qml_selection', 'All'))
+                if i >= 0:
+                    qc.setCurrentIndex(i)
+
+    # ------------------------------------------------------------------
+    # Apply logic
+    # ------------------------------------------------------------------
+
+    def _collect_inputs(self):
+        folder = self.folder_edit.text().strip()
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, 'Input Error', 'Please select a valid source folder.')
+            return None
+
+        default_theme = self.default_theme_combo.currentText()
+        if default_theme.startswith('(none'):
+            default_theme = None
+
+        layers = []
+        for row in range(self.layer_table.rowCount()):
+            fi = self.layer_table.item(row, COL_SRC)
+            di = self.layer_table.item(row, COL_NAME)
+            tc = self.layer_table.cellWidget(row, COL_THEME)
+            qc = self.layer_table.cellWidget(row, COL_QML)
+
+            fname   = fi.text() if fi else ''
+            display = (di.text().strip() if di else '') or os.path.splitext(fname)[0]
+            alt     = tc.currentText() if isinstance(tc, QComboBox) else '(use default)'
+            qsel    = qc.currentText() if isinstance(qc, QComboBox) else 'All'
+            layers.append({
+                'filename':      fname,
+                'display_name':  display,
+                'alt_theme':     alt,
+                'qml_selection': qsel,
+            })
+
+        if not layers:
+            QMessageBox.warning(self, 'Input Error', 'No layers detected in the selected folder.')
+            return None
+
+        qml_pairs = []
+        for row in range(self.qml_table.rowCount()):
+            pi = self.qml_table.item(row, 0)
+            ni = self.qml_table.item(row, 1)
+            si = self.qml_table.item(row, 2)
+            if not pi:
+                continue
+            qml_path   = pi.text().strip()
+            style_name = (ni.text().strip() if ni else '') or auto_clean(
+                os.path.splitext(os.path.basename(qml_path))[0]
+            )
+            suffix = si.text().strip() if si else ''
+            if qml_path and os.path.isfile(qml_path):
+                qml_pairs.append((qml_path, style_name, suffix))
+
+        if not qml_pairs:
+            QMessageBox.warning(self, 'Input Error', 'Please add at least one valid QML file.')
+            return None
+
+        return folder, default_theme, layers, qml_pairs
+
+    def _apply(self):
+        inputs = self._collect_inputs()
+        if inputs is None:
+            return
+
+        folder, default_theme, layers, qml_pairs = inputs
+        errors        = []
+        themes_created = 0
+        layers_loaded  = 0
+
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.setText('Working…')
+        self.repaint()
+
+        try:
+            for info in layers:
+                fname        = info['filename']
+                display_name = info['display_name']
+                alt_theme    = info['alt_theme']
+                qml_sel      = info['qml_selection']
+
+                # Resolve effective base theme for this layer
+                if alt_theme == '(use default)':
+                    effective_theme = default_theme
+                else:
+                    effective_theme = alt_theme
+
+                # Filter QML pairs for this layer
+                if qml_sel == 'All':
+                    active_pairs = qml_pairs
+                else:
+                    active_pairs = [p for p in qml_pairs if p[1] == qml_sel]
+
+                if not active_pairs:
+                    continue
+
+                path = os.path.join(folder, fname)
+                ext  = os.path.splitext(fname)[1].lower()
+
+                if ext in VECTOR_EXTS:
+                    layer = QgsVectorLayer(path, display_name, 'ogr')
+                else:
+                    layer = QgsRasterLayer(path, display_name)
+
+                if not layer.isValid():
+                    errors.append(f'Could not load: {fname}')
+                    continue
+
+                QgsProject.instance().addMapLayer(layer)
+                layers_loaded += 1
+                mgr = layer.styleManager()
+
+                for qml_path, style_name, suffix in active_pairs:
+                    named_style = f'{style_name}-{suffix}' if suffix else style_name
+
+                    msg, ok = layer.loadNamedStyle(qml_path)
+                    if not ok:
+                        errors.append(
+                            f'{fname} / {os.path.basename(qml_path)}: {msg}'
+                        )
+                        continue
+
+                    captured = QgsMapLayerStyle()
+                    captured.readFromLayer(layer)
+                    if named_style in mgr.styles():
+                        mgr.removeStyle(named_style)
+                    mgr.addStyle(named_style, captured)
+                    mgr.setCurrentStyle(named_style)
+                    layer.triggerRepaint()
+
+                    parts = [display_name, style_name]
+                    if suffix:
+                        parts.append(suffix)
+                    theme_name = ' - '.join(parts)
+
+                    self._create_theme(theme_name, effective_theme, layer, named_style)
+                    themes_created += 1
+
+        finally:
+            self.apply_btn.setEnabled(True)
+            self.apply_btn.setText('Apply')
+
+        summary = f'Loaded {layers_loaded} layer(s), created {themes_created} theme(s).'
+        if errors:
+            summary += '\n\nWarnings:\n' + '\n'.join(errors)
+            QMessageBox.warning(self, 'Complete with warnings', summary)
+        else:
+            QMessageBox.information(self, 'Complete', summary)
+
+    # ------------------------------------------------------------------
+    # Theme creation
+    # ------------------------------------------------------------------
+
+    def _create_theme(self, theme_name, base_theme_name, target_layer, style_name):
+        collection = QgsProject.instance().mapThemeCollection()
+        new_record  = QgsMapThemeCollection.MapThemeRecord()
+
+        if base_theme_name and base_theme_name in collection.mapThemes():
+            base     = collection.mapThemeState(base_theme_name)
+            base_ids = set()
+
+            for lr in base.layerRecords():
+                lyr = lr.layer()
+                if not lyr:
+                    continue
+                base_ids.add(lyr.id())
+
+                if lyr.id() == target_layer.id():
+                    new_lr = QgsMapThemeCollection.MapThemeLayerRecord(target_layer)
+                    new_lr.currentStyle    = style_name
+                    new_lr.usingCurrentStyle = True
+                    new_record.addLayerRecord(new_lr)
+                else:
+                    new_record.addLayerRecord(lr)
+
+            if target_layer.id() not in base_ids:
+                new_lr = QgsMapThemeCollection.MapThemeLayerRecord(target_layer)
+                new_lr.currentStyle      = style_name
+                new_lr.usingCurrentStyle = True
+                new_record.addLayerRecord(new_lr)
+        else:
+            new_lr = QgsMapThemeCollection.MapThemeLayerRecord(target_layer)
+            new_lr.currentStyle      = style_name
+            new_lr.usingCurrentStyle = True
+            new_record.addLayerRecord(new_lr)
+
+        collection.insert(theme_name, new_record)
+
+
+# ---------------------------------------------------------------------------
+# Processing Algorithm wrapper
+# ---------------------------------------------------------------------------
+
+class LayerThemeCreator(QgsProcessingAlgorithm):
+
+    def createInstance(self):
+        return LayerThemeCreator()
+
+    def name(self):
+        return 'layer_theme_creator'
+
+    def displayName(self):
+        return 'Layer Theme Creator'
+
+    def group(self):
+        return 'Reporting'
+
+    def groupId(self):
+        return 'reporting'
+
+    def shortHelpString(self):
+        return (
+            'Loads .shp / raster layers from a folder, applies QML files as '
+            'named styles in each layer\'s Style Manager, then creates map '
+            'themes named  <b>Display Name – Style Name – Suffix</b>.\n\n'
+            'Each layer can override the Default Theme with its own Alt Theme, '
+            'and can be restricted to a single QML style. '
+            'Settings can be saved and reloaded via JSON.'
+        )
+
+    def flags(self):
+        return super().flags() | QgsProcessingAlgorithm.FlagNoThreading
+
+    def initAlgorithm(self, config=None):
+        pass
+
+    def processAlgorithm(self, parameters, context, feedback):
+        from qgis.utils import iface
+        dlg = LayerThemeDialog(iface.mainWindow())
+        dlg.exec_()
+        return {}
