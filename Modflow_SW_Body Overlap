@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 16 10:25:55 2026
+
+@author: MOByrne
+"""
+
+"""
+mesh_coverage.py
+----------------
+Calculates the percentage of each mesh polygon covered by irregular overlay polygons.
+
+Inputs:
+  - Mesh shapefile (regular grid / numbered zones)
+  - Irregular polygons shapefile (overlapping features)
+
+Output:
+  - Shapefile of mesh polygons with a new field: PCT_COVER (0–100)
+
+Dependencies:
+  pip install geopandas shapely
+"""
+
+import sys
+import geopandas as gpd
+from shapely.ops import unary_union
+
+
+# ─────────────────────────────────────────────
+# CONFIGURATION – edit these paths
+# ─────────────────────────────────────────────
+MESH_PATH       = r"C:\Modflow\Automated_Post_20260615\Build\Boundaries\BL_V5_Set38_C16_SS_RCH_poly.shp"          # Input: mesh / numbered zone polygons
+IRREGULAR_PATH  = r"P:\2025 PROJECTS\4069-25 Heidelberg Materials Scott Pit Hydrogeology\001 Heidelberg Scott Pit Hydrogeology\Data\Numerical Modelling\Boundary Condition Setup\Surface Water\Water_Bodies.shp"     # Input: irregular overlay polygons
+OUTPUT_PATH     = r"C:\Modflow\Automated_Post_20260615\Build\Boundaries\mesh_coverage.shp" # Output shapefile
+
+# Name of the coverage field written to the output
+COVER_FIELD     = "PCT_COVER"
+
+# Optional: field in the mesh to carry through as an ID (set to None to skip)
+MESH_ID_FIELD   = None   # e.g. "ZONE_ID"
+# ─────────────────────────────────────────────
+
+
+def calculate_coverage(mesh_path: str,
+                       irregular_path: str,
+                       output_path: str,
+                       cover_field: str = "PCT_COVER",
+                       mesh_id_field: str | None = None) -> gpd.GeoDataFrame:
+    """
+    For every polygon in the mesh, compute what percentage of its area is
+    covered by the union of all irregular polygons that intersect it.
+
+    Returns the mesh GeoDataFrame with the new coverage field appended.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load data
+    # ------------------------------------------------------------------
+    print(f"Loading mesh:       {mesh_path}")
+    mesh = gpd.read_file(mesh_path)
+
+    print(f"Loading irregular:  {irregular_path}")
+    irr  = gpd.read_file(irregular_path)
+
+    # ------------------------------------------------------------------
+    # 2. CRS alignment – reproject irregular to match mesh if needed
+    # ------------------------------------------------------------------
+    if mesh.crs is None:
+        print("WARNING: Mesh has no CRS defined.")
+    if irr.crs is None:
+        print("WARNING: Irregular layer has no CRS defined.")
+
+    if mesh.crs and irr.crs and mesh.crs != irr.crs:
+        print(f"Reprojecting irregular layer from {irr.crs} → {mesh.crs}")
+        irr = irr.to_crs(mesh.crs)
+
+    # ------------------------------------------------------------------
+    # 3. Build a single dissolved union of all irregular polygons
+    #    (avoids double-counting overlapping irregular features)
+    # ------------------------------------------------------------------
+    print("Dissolving irregular polygons …")
+    irr_union = unary_union(irr.geometry)
+
+    # ------------------------------------------------------------------
+    # 4. For each mesh cell, intersect with the dissolved irregular union
+    # ------------------------------------------------------------------
+    print(f"Computing coverage for {len(mesh)} mesh polygons …")
+
+    pct_coverage = []
+
+    for idx, row in mesh.iterrows():
+        cell_geom  = row.geometry
+
+        if cell_geom is None or cell_geom.is_empty:
+            pct_coverage.append(0.0)
+            continue
+
+        cell_area = cell_geom.area
+        if cell_area == 0:
+            pct_coverage.append(0.0)
+            continue
+
+        # Clip the dissolved irregular geometry to the mesh cell
+        try:
+            overlap = cell_geom.intersection(irr_union)
+        except Exception as e:
+            print(f"  Row {idx}: intersection error – {e}. Setting coverage to 0.")
+            pct_coverage.append(0.0)
+            continue
+
+        if overlap.is_empty:
+            pct_coverage.append(0.0)
+        else:
+            pct = (overlap.area / cell_area) * 100.0
+            pct_coverage.append(round(pct, 4))
+
+    # ------------------------------------------------------------------
+    # 5. Assemble output
+    # ------------------------------------------------------------------
+    # Keep geometry + optionally the mesh zone-ID field; add coverage
+    keep_cols = ["geometry"]
+    if mesh_id_field and mesh_id_field in mesh.columns:
+        keep_cols = [mesh_id_field, "geometry"]
+
+    out = mesh[keep_cols].copy()
+    # Carry all original mesh attributes through
+    out = mesh.copy()
+    out[cover_field] = pct_coverage
+
+    # ------------------------------------------------------------------
+    # 6. Save
+    # ------------------------------------------------------------------
+    out.to_file(output_path)
+    print(f"\nDone. Output written to: {output_path}")
+    print(f"  Rows : {len(out)}")
+    print(f"  Field: {cover_field}  (range {min(pct_coverage):.2f} – {max(pct_coverage):.2f})")
+
+    return out
+
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    # Allow command-line overrides:
+    #   python mesh_coverage.py mesh.shp irregular.shp output.shp
+    if len(sys.argv) == 4:
+        MESH_PATH, IRREGULAR_PATH, OUTPUT_PATH = sys.argv[1], sys.argv[2], sys.argv[3]
+    elif len(sys.argv) != 1:
+        print("Usage: python mesh_coverage.py [mesh.shp irregular.shp output.shp]")
+        sys.exit(1)
+
+    calculate_coverage(
+        mesh_path      = MESH_PATH,
+        irregular_path = IRREGULAR_PATH,
+        output_path    = OUTPUT_PATH,
+        cover_field    = COVER_FIELD,
+        mesh_id_field  = MESH_ID_FIELD,
+    )
