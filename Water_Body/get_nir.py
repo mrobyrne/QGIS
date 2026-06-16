@@ -2,10 +2,7 @@
 get_nir.py -- fetch free Sentinel-2 NIR/SWIR (+G,R) from AWS Earth Search
 (public COGs, no auth) for the DEM's AOI, warp onto the exact DEM grid,
 and save locally as a 4-band GeoTIFF (G, R, NIR, SWIR) plus NDWI/NDMI.
-
-    python get_nir.py --dem topo.tif --out sentinel2_aoi.tif
 """
-import argparse
 import requests
 import numpy as np
 import rasterio
@@ -13,8 +10,16 @@ from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 
+# =============================================================================
+# CONFIG -- edit these before running in Spyder
+# =============================================================================
+DEM     = r"C:\QGIS\Water_Body\topo.tif"
+OUT     = r"C:\QGIS\Water_Body\sentinel2_aoi.tif"
+DATETIME  = "2024-06-01T00:00:00Z/2025-09-30T23:59:59Z"
+MAX_CLOUD = 15.0
+# =============================================================================
+
 STAC = "https://earth-search.aws.element84.com/v1/search"
-# Sentinel-2 L2A common-name assets on Earth Search
 ASSETS = {"green": "green", "red": "red", "nir": "nir", "swir": "swir16"}
 GDAL_ENV = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
                 CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif",
@@ -36,24 +41,18 @@ def search(bbox, datetime, max_cloud, limit=30):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dem", required=True)
-    ap.add_argument("--out", default="sentinel2_aoi.tif")
-    ap.add_argument("--datetime",
-                    default="2024-06-01T00:00:00Z/2025-09-30T23:59:59Z")
-    ap.add_argument("--max-cloud", type=float, default=15)
-    a = ap.parse_args()
-
-    with rasterio.open(a.dem) as ds:
+    with rasterio.open(DEM) as ds:
         dem_crs, dem_t = ds.crs, ds.transform
         dem_w, dem_h, dem_bounds = ds.width, ds.height, ds.bounds
+
     bbox4326 = transform_bounds(dem_crs, "EPSG:4326", *dem_bounds)
     print("AOI bbox (4326):", [round(x, 4) for x in bbox4326])
 
-    items = search(bbox4326, a.datetime, a.max_cloud)
-    print(f"{len(items)} scenes < {a.max_cloud}% cloud")
+    items = search(bbox4326, DATETIME, MAX_CLOUD)
+    print(f"{len(items)} scenes < {MAX_CLOUD}% cloud")
     if not items:
-        raise SystemExit("no scenes found; widen --datetime or --max-cloud")
+        raise SystemExit("no scenes found; widen DATETIME or MAX_CLOUD")
+
     it = items[0]
     print("chosen:", it["id"], "cloud %.1f%%" % it["properties"]["eo:cloud_cover"],
           it["properties"]["datetime"][:10])
@@ -71,23 +70,25 @@ def main():
 
     G, Rr, NIR, SWIR = bands["green"], bands["red"], bands["nir"], bands["swir"]
     eps = 1e-6
-    ndwi = (G - NIR) / (G + NIR + eps)          # McFeeters: open water
-    ndvi = (NIR - Rr) / (NIR + Rr + eps)        # vegetation
-    ndmi = (NIR - SWIR) / (NIR + SWIR + eps)    # veg/soil moisture (marsh)
+    ndwi = (G - NIR) / (G + NIR + eps)
+    ndvi = (NIR - Rr) / (NIR + Rr + eps)
+    ndmi = (NIR - SWIR) / (NIR + SWIR + eps)
 
     prof = dict(driver="GTiff", height=dem_h, width=dem_w, count=6,
                 dtype="float32", crs=dem_crs, transform=dem_t,
                 compress="deflate", tiled=True)
-    with rasterio.open(a.out, "w", **prof) as dst:
+    with rasterio.open(OUT, "w", **prof) as dst:
         for i, (nm, arr) in enumerate(
                 [("green", G), ("red", Rr), ("nir", NIR), ("swir", SWIR),
                  ("ndwi", ndwi), ("ndmi", ndmi)], start=1):
-            dst.write(arr, i); dst.set_band_description(i, nm)
-    print("wrote", a.out)
+            dst.write(arr, i)
+            dst.set_band_description(i, nm)
+    print("wrote", OUT)
 
     def stat(n, v):
         print("  %-5s min %7.3f  med %7.3f  max %7.3f"
               % (n, np.nanmin(v), np.nanmedian(v), np.nanmax(v)))
+
     print("index stats:")
     for n, v in [("ndwi", ndwi), ("ndvi", ndvi), ("ndmi", ndmi)]:
         stat(n, v)
