@@ -1,0 +1,17 @@
+# Input data (provide your own)
+topo.tif
+
+# Generated rasters / imagery (large; Esri tiles not redistributable)
+esri_rgb*.tif
+sentinel2_aoi.tif
+_tilecache_*/
+
+# Generated vector outputs
+*.gpkg
+
+# Generated previews
+*.png
+
+# Python
+__pycache__/
+*.pyc
